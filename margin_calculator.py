@@ -6,6 +6,7 @@ This replaces the old run_margin.py with single-file processing.
 import time
 import re
 from pathlib import Path
+from typing import Optional
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 import pyperclip
 from openpyxl import load_workbook
@@ -71,7 +72,78 @@ def write_margin_to_excel(excel_path, margin_result):
         return False
 
 
-def run_margin_calc(excel_path):
+class BrowserSession:
+    """Manage a long-lived Playwright browser/page for repeated calculations."""
+
+    def __init__(self):
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._initialized = False
+
+    def ensure_page(self):
+        """Return a ready-to-use Playwright page without reloading unnecessarily."""
+
+        if self._playwright is None:
+            self._playwright = sync_playwright().start()
+
+        if self._browser is None or not self._browser.is_connected():
+            self._browser = self._playwright.chromium.launch(
+                headless=False, slow_mo=150
+            )
+            # Browser restart implies a fresh context/page as well.
+            self._context = None
+            self._page = None
+            self._initialized = False
+
+        if self._context is None:
+            self._context = self._browser.new_context(storage_state=SESSION_FILE)
+            self._page = None
+            self._initialized = False
+
+        if self._page is None or self._page.is_closed():
+            self._page = self._context.new_page()
+            self._initialized = False
+
+        if not self._initialized:
+            print("\n🌐 Opening ICE ICA application...")
+            self._page.goto(APP_URL, timeout=60000)
+            self._page.wait_for_load_state("networkidle")
+            self._initialized = True
+
+        return self._page
+
+    def mark_needs_reload(self):
+        """Indicate that the next call should reload the main application URL."""
+
+        self._initialized = False
+
+    def close(self):
+        """Close the Playwright resources (optional – browser can stay open)."""
+
+        if self._page and not self._page.is_closed():
+            self._page.close()
+        self._page = None
+
+        if self._context:
+            self._context.close()
+        self._context = None
+
+        if self._browser and self._browser.is_connected():
+            self._browser.close()
+        self._browser = None
+
+        if self._playwright:
+            self._playwright.stop()
+        self._playwright = None
+        self._initialized = False
+
+
+browser_session = BrowserSession()
+
+
+def run_margin_calc(excel_path, session: Optional[BrowserSession] = None):
     """
     Main function to run ICE margin calculator.
     1. Uploads the Excel file to ICE
@@ -97,104 +169,95 @@ def run_margin_calc(excel_path):
     # Read Excel to show info
     read_excel_file(excel_path)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=150)
-        context = browser.new_context(storage_state=SESSION_FILE)
-        page = context.new_page()
+    session = session or browser_session
+    page = session.ensure_page()
 
-        try:
-            print(f"\n🌐 Opening ICE ICA application...")
-            page.goto(APP_URL, timeout=60000)
-            page.wait_for_load_state("networkidle")
-
-            # Check and clear existing portfolios
-            checkbox_locator = (
-                page.get_by_role(
-                    "gridcell",
-                    name="Press Space to toggle row selection (unchecked) All Portfolios (1)",
-                )
-                .get_by_label("Press Space to toggle row")
-                .first
-            )
-
-            if checkbox_locator.count() > 0:
-                print("🗑️  Clearing existing portfolios...")
-                checkbox_locator.check()
-                page.get_by_role("button", name="Actions").first.click()
-                page.get_by_role("button", name="Delete").click()
-                page.get_by_text("Delete", exact=True).click()
-                page.get_by_role(
-                    "columnheader",
-                    name="Press Space to toggle all rows selection (unchecked) Calculation ID",
-                ).get_by_label("Press Space to toggle all").first.check()
-                page.get_by_role("button", name="Actions").nth(1).click()
-                page.get_by_role("button", name="Delete").nth(1).click()
-                page.get_by_role("button", name="OK").click()
-                time.sleep(2)
-            else:
-                print("✓ No existing portfolios to clear")
-
-            # Navigate to Tools → Upload Trades
-            print("\n📤 Uploading positions file...")
-            page.get_by_role("menuitem", name="Tools").click()
-            page.get_by_role("menuitem", name="Upload Trades").click()
-
-            # Upload the Excel file
+    try:
+        # Check and clear existing portfolios
+        checkbox_locator = (
             page.get_by_role(
-                "button", name=re.compile("Select file", re.I)
-            ).set_input_files(str(excel_path))
-            page.get_by_role("button", name="Upload").click()
+                "gridcell",
+                name="Press Space to toggle row selection (unchecked) All Portfolios (1)",
+            )
+            .get_by_label("Press Space to toggle row")
+            .first
+        )
 
-            # Wait for upload confirmation
-            page.wait_for_selector("button:has-text('OK')", timeout=60000)
+        if checkbox_locator.count() > 0:
+            print("🗑️  Clearing existing portfolios...")
+            checkbox_locator.check()
+            page.get_by_role("button", name="Actions").first.click()
+            page.get_by_role("button", name="Delete").click()
+            page.get_by_text("Delete", exact=True).click()
+            page.get_by_role(
+                "columnheader",
+                name="Press Space to toggle all rows selection (unchecked) Calculation ID",
+            ).get_by_label("Press Space to toggle all").first.check()
+            page.get_by_role("button", name="Actions").nth(1).click()
+            page.get_by_role("button", name="Delete").nth(1).click()
             page.get_by_role("button", name="OK").click()
-            print("✅ Upload completed")
+            time.sleep(2)
+        else:
+            print("✓ No existing portfolios to clear")
 
-            # Select all accounts and run calculation
-            print("\n🧮 Running margin calculation...")
-            page.locator(
-                "input[aria-label*='Press Space to toggle row selection']"
-            ).first.check()
-            page.get_by_role("button", name="Run Analytics").click()
-            page.get_by_role("tabpanel").filter(has_text="Run").get_by_role(
-                "button"
-            ).nth(1).click()
+        # Navigate to Tools → Upload Trades
+        print("\n📤 Uploading positions file...")
+        page.get_by_role("menuitem", name="Tools").click()
+        page.get_by_role("menuitem", name="Upload Trades").click()
 
-            # Wait for calculation to complete (fixed time)
-            print("⏳ Waiting for calculation to complete (5 seconds)...")
-            time.sleep(5)  # Results appear within 5 seconds
-            print("✅ Calculation completed")
+        # Upload the Excel file
+        page.get_by_role("button", name=re.compile("Select file", re.I)).set_input_files(
+            str(excel_path)
+        )
+        page.get_by_role("button", name="Upload").click()
 
-            # Get the margin result directly from the cell
-            print("\n📋 Extracting margin result...")
+        # Wait for upload confirmation
+        page.wait_for_selector("button:has-text('OK')", timeout=60000)
+        page.get_by_role("button", name="OK").click()
+        print("✅ Upload completed")
 
-            # Method 1: Try to get text directly from the cell
-            try:
-                result_cell = page.locator(RESULT_CELL_ID)
-                result_cell.wait_for(timeout=30000, state="visible")  # 30 second timeout
-                copied_text = result_cell.inner_text().strip()
-                print(f"✅ Margin extracted: {copied_text}")
-            except Exception as e:
-                print(f"⚠️ Direct extraction failed: {e}")
-                # Method 2: Fallback to clipboard method
-                print("Trying clipboard method...")
-                page.locator(RESULT_CELL_ID).click(button="right", timeout=60000)
-                time.sleep(0.5)
-                page.get_by_text("Copy").first.click(timeout=5000)
-                time.sleep(1)
-                copied_text = pyperclip.paste().strip()
-                print(f"✅ Margin copied via clipboard: {copied_text}")
+        # Select all accounts and run calculation
+        print("\n🧮 Running margin calculation...")
+        page.locator("input[aria-label*='Press Space to toggle row selection']").first.check()
+        page.get_by_role("button", name="Run Analytics").click()
+        page.get_by_role("tabpanel").filter(has_text="Run").get_by_role("button").nth(1).click()
 
-            # Result will be shown in the modal
-            print(f"\n{'='*60}")
-            print(f"✅ SUCCESS! Margin: {copied_text}")
-            print(f"{'='*60}\n")
+        # Wait for calculation to complete (fixed time)
+        print("⏳ Waiting for calculation to complete (5 seconds)...")
+        time.sleep(5)  # Results appear within 5 seconds
+        print("✅ Calculation completed")
 
-            return copied_text
+        # Get the margin result directly from the cell
+        print("\n📋 Extracting margin result...")
 
+        # Method 1: Try to get text directly from the cell
+        try:
+            result_cell = page.locator(RESULT_CELL_ID)
+            result_cell.wait_for(timeout=30000, state="visible")  # 30 second timeout
+            copied_text = result_cell.inner_text().strip()
+            print(f"✅ Margin extracted: {copied_text}")
         except Exception as e:
-            print(f"\n❌ Error during calculation: {e}")
-            raise
+            print(f"⚠️ Direct extraction failed: {e}")
+            # Method 2: Fallback to clipboard method
+            print("Trying clipboard method...")
+            page.locator(RESULT_CELL_ID).click(button="right", timeout=60000)
+            time.sleep(0.5)
+            page.get_by_text("Copy").first.click(timeout=5000)
+            time.sleep(1)
+            copied_text = pyperclip.paste().strip()
+            print(f"✅ Margin copied via clipboard: {copied_text}")
+
+        # Result will be shown in the modal
+        print(f"\n{'='*60}")
+        print(f"✅ SUCCESS! Margin: {copied_text}")
+        print(f"{'='*60}\n")
+
+        return copied_text
+
+    except Exception as e:
+        print(f"\n❌ Error during calculation: {e}")
+        session.mark_needs_reload()
+        raise
 
 
 if __name__ == "__main__":
