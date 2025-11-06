@@ -1,0 +1,14 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Excel temp files
+~$*.xlsx
+
+# IDE settings
+.vscode/
+*.log
+
+# OS-specific
+.DS_Store
+Thumbs.db
