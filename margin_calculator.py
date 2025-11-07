@@ -6,6 +6,7 @@ This replaces the old run_margin.py with single-file processing.
 import time
 import re
 from pathlib import Path
+from threading import Lock, get_ident
 from typing import Optional
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 import pyperclip
@@ -81,47 +82,65 @@ class BrowserSession:
         self._context = None
         self._page = None
         self._initialized = False
+        self._owner_thread_id: Optional[int] = None
+        self._lock = Lock()
 
     def ensure_page(self):
         """Return a ready-to-use Playwright page without reloading unnecessarily."""
 
-        if self._playwright is None:
-            self._playwright = sync_playwright().start()
+        with self._lock:
+            current_thread = get_ident()
 
-        if self._browser is None or not self._browser.is_connected():
-            self._browser = self._playwright.chromium.launch(
-                headless=False, slow_mo=150
-            )
-            # Browser restart implies a fresh context/page as well.
-            self._context = None
-            self._page = None
-            self._initialized = False
+            if self._owner_thread_id is not None and self._owner_thread_id != current_thread:
+                # Existing Playwright objects cannot be shared across threads. Tear them down
+                # so the new thread can create its own browser/page safely.
+                self._teardown_locked()
 
-        if self._context is None:
-            self._context = self._browser.new_context(storage_state=SESSION_FILE)
-            self._page = None
-            self._initialized = False
+            if self._owner_thread_id != current_thread:
+                self._owner_thread_id = current_thread
 
-        if self._page is None or self._page.is_closed():
-            self._page = self._context.new_page()
-            self._initialized = False
+            if self._playwright is None:
+                self._playwright = sync_playwright().start()
 
-        if not self._initialized:
-            print("\n🌐 Opening ICE ICA application...")
-            self._page.goto(APP_URL, timeout=60000)
-            self._page.wait_for_load_state("networkidle")
-            self._initialized = True
+            if self._browser is None or not self._browser.is_connected():
+                self._browser = self._playwright.chromium.launch(
+                    headless=False, slow_mo=150
+                )
+                # Browser restart implies a fresh context/page as well.
+                self._context = None
+                self._page = None
+                self._initialized = False
 
-        return self._page
+            if self._context is None:
+                self._context = self._browser.new_context(storage_state=SESSION_FILE)
+                self._page = None
+                self._initialized = False
+
+            if self._page is None or self._page.is_closed():
+                self._page = self._context.new_page()
+                self._initialized = False
+
+            if not self._initialized:
+                print("\n🌐 Opening ICE ICA application...")
+                self._page.goto(APP_URL, timeout=60000)
+                self._page.wait_for_load_state("networkidle")
+                self._initialized = True
+
+            return self._page
 
     def mark_needs_reload(self):
         """Indicate that the next call should reload the main application URL."""
 
-        self._initialized = False
+        with self._lock:
+            self._initialized = False
 
     def close(self):
         """Close the Playwright resources (optional – browser can stay open)."""
 
+        with self._lock:
+            self._teardown_locked()
+
+    def _teardown_locked(self):
         if self._page and not self._page.is_closed():
             self._page.close()
         self._page = None
@@ -138,6 +157,7 @@ class BrowserSession:
             self._playwright.stop()
         self._playwright = None
         self._initialized = False
+        self._owner_thread_id = None
 
 
 browser_session = BrowserSession()
