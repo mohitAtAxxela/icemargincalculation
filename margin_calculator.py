@@ -91,7 +91,10 @@ class BrowserSession:
         with self._lock:
             current_thread = get_ident()
 
-            if self._owner_thread_id is not None and self._owner_thread_id != current_thread:
+            if (
+                self._owner_thread_id is not None
+                and self._owner_thread_id != current_thread
+            ):
                 # Existing Playwright objects cannot be shared across threads. Tear them down
                 # so the new thread can create its own browser/page safely.
                 self._teardown_locked()
@@ -226,9 +229,9 @@ def run_margin_calc(excel_path, session: Optional[BrowserSession] = None):
         page.get_by_role("menuitem", name="Upload Trades").click()
 
         # Upload the Excel file
-        page.get_by_role("button", name=re.compile("Select file", re.I)).set_input_files(
-            str(excel_path)
-        )
+        page.get_by_role(
+            "button", name=re.compile("Select file", re.I)
+        ).set_input_files(str(excel_path))
         page.get_by_role("button", name="Upload").click()
 
         # Wait for upload confirmation
@@ -238,9 +241,13 @@ def run_margin_calc(excel_path, session: Optional[BrowserSession] = None):
 
         # Select all accounts and run calculation
         print("\n🧮 Running margin calculation...")
-        page.locator("input[aria-label*='Press Space to toggle row selection']").first.check()
+        page.locator(
+            "input[aria-label*='Press Space to toggle row selection']"
+        ).first.check()
         page.get_by_role("button", name="Run Analytics").click()
-        page.get_by_role("tabpanel").filter(has_text="Run").get_by_role("button").nth(1).click()
+        page.get_by_role("tabpanel").filter(has_text="Run").get_by_role("button").nth(
+            1
+        ).click()
 
         # Wait for calculation to complete (fixed time)
         print("⏳ Waiting for calculation to complete (5 seconds)...")
@@ -248,31 +255,31 @@ def run_margin_calc(excel_path, session: Optional[BrowserSession] = None):
         print("✅ Calculation completed")
 
         # Get the margin result directly from the cell
-        print("\n📋 Extracting margin result...")
+        # print("\n📋 Extracting margin result...")
 
-        # Method 1: Try to get text directly from the cell
-        try:
-            result_cell = page.locator(RESULT_CELL_ID)
-            result_cell.wait_for(timeout=30000, state="visible")  # 30 second timeout
-            copied_text = result_cell.inner_text().strip()
-            print(f"✅ Margin extracted: {copied_text}")
-        except Exception as e:
-            print(f"⚠️ Direct extraction failed: {e}")
-            # Method 2: Fallback to clipboard method
-            print("Trying clipboard method...")
-            page.locator(RESULT_CELL_ID).click(button="right", timeout=60000)
-            time.sleep(0.5)
-            page.get_by_text("Copy").first.click(timeout=5000)
-            time.sleep(1)
-            copied_text = pyperclip.paste().strip()
-            print(f"✅ Margin copied via clipboard: {copied_text}")
+        # # Method 1: Try to get text directly from the cell
+        # try:
+        #     result_cell = page.locator(RESULT_CELL_ID)
+        #     result_cell.wait_for(timeout=30000, state="visible")  # 30 second timeout
+        #     copied_text = result_cell.inner_text().strip()
+        #     print(f"✅ Margin extracted: {copied_text}")
+        # except Exception as e:
+        #     print(f"⚠️ Direct extraction failed: {e}")
+        #     # Method 2: Fallback to clipboard method
+        #     print("Trying clipboard method...")
+        #     page.locator(RESULT_CELL_ID).click(button="right", timeout=60000)
+        #     time.sleep(0.5)
+        #     page.get_by_text("Copy").first.click(timeout=5000)
+        #     time.sleep(1)
+        #     copied_text = pyperclip.paste().strip()
+        #     print(f"✅ Margin copied via clipboard: {copied_text}")
 
-        # Result will be shown in the modal
-        print(f"\n{'='*60}")
-        print(f"✅ SUCCESS! Margin: {copied_text}")
-        print(f"{'='*60}\n")
+        # # Result will be shown in the modal
+        # print(f"\n{'='*60}")
+        # print(f"✅ SUCCESS! Margin: {copied_text}")
+        # print(f"{'='*60}\n")
 
-        return copied_text
+        # return copied_text
 
     except Exception as e:
         print(f"\n❌ Error during calculation: {e}")
@@ -283,7 +290,7 @@ def run_margin_calc(excel_path, session: Optional[BrowserSession] = None):
 if __name__ == "__main__":
     # Test run
     try:
-        result = run_margin_calc(EXCEL_FILE)
-        print(f"Final result: {result}")
+        run_margin_calc(EXCEL_FILE)
+        # print(f"Final result: {result}")
     except Exception as e:
         print(f"Failed: {e}")
