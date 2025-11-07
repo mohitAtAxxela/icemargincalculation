@@ -117,17 +117,17 @@ def run_margin_calc(file_path: str):
         # page.wait_for_selector("#cell-1280", timeout=90_000)
 
         # 6️⃣ Copy the result
-        print("Copying margin result...")
-        page.locator("#cell-1280").click(button="right")
-        page.get_by_text("Copy").first.click()
-        time.sleep(1)
+        # print("Copying margin result...")
+        # page.locator("#cell-1280").click(button="right")
+        # page.get_by_text("Copy").first.click()
+        # time.sleep(1)
 
-        copied_text = pyperclip.paste().strip()
-        print(f"✅ {Path(file_path).name} → {copied_text}")
+        # copied_text = pyperclip.paste().strip()
+        # print(f"✅ {Path(file_path).name} → {copied_text}")
 
         context.close()
         browser.close()
-        return copied_text
+        return 
 
 
 def run_all_files():
@@ -138,7 +138,7 @@ def run_all_files():
     for f in files:
         print(f"\n=== Processing {f.name} ===")
         try:
-            result = run_margin_calc(str(f))
+            run_margin_calc(str(f))
         except Exception as e:
             result = f"Error: {e}"
             print("❌", result)

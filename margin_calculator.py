@@ -6,9 +6,10 @@ This replaces the old run_margin.py with single-file processing.
 import time
 import re
 from pathlib import Path
-from threading import Lock, get_ident
-from typing import Optional
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+from queue import Queue
+from threading import Event, Lock, Thread
+from typing import Callable, Optional
+from playwright.sync_api import sync_playwright
 import pyperclip
 from openpyxl import load_workbook
 
@@ -73,97 +74,239 @@ def write_margin_to_excel(excel_path, margin_result):
         return False
 
 
+class _Task:
+    """Internal helper representing work for the Playwright worker thread."""
+
+    def __init__(self, fn: Callable, args: tuple, kwargs: dict):
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self._event = Event()
+        self.result = None
+        self.exception: Optional[Exception] = None
+
+    def set_result(self, value):
+        self.result = value
+        self._event.set()
+
+    def set_exception(self, error: Exception):
+        self.exception = error
+        self._event.set()
+
+    def wait(self):
+        self._event.wait()
+
+
 class BrowserSession:
-    """Manage a long-lived Playwright browser/page for repeated calculations."""
+    """Manage a long-lived Playwright browser/page on a dedicated worker thread."""
 
     def __init__(self):
-        self._playwright = None
-        self._browser = None
-        self._context = None
-        self._page = None
-        self._initialized = False
-        self._owner_thread_id: Optional[int] = None
-        self._lock = Lock()
+        self._task_queue: "Queue[object]" = Queue()
+        self._thread: Optional[Thread] = None
+        self._thread_lock = Lock()
+        self._reload_event = Event()
+        self._stop_sentinel = object()
 
-    def ensure_page(self):
-        """Return a ready-to-use Playwright page without reloading unnecessarily."""
-
-        with self._lock:
-            current_thread = get_ident()
-
-            if (
-                self._owner_thread_id is not None
-                and self._owner_thread_id != current_thread
-            ):
-                # Existing Playwright objects cannot be shared across threads. Tear them down
-                # so the new thread can create its own browser/page safely.
-                self._teardown_locked()
-
-            if self._owner_thread_id != current_thread:
-                self._owner_thread_id = current_thread
-
-            if self._playwright is None:
-                self._playwright = sync_playwright().start()
-
-            if self._browser is None or not self._browser.is_connected():
-                self._browser = self._playwright.chromium.launch(
-                    headless=False, slow_mo=150
+    def _ensure_worker(self):
+        with self._thread_lock:
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = Thread(
+                    target=self._worker_loop, name="BrowserSessionWorker", daemon=True
                 )
-                # Browser restart implies a fresh context/page as well.
-                self._context = None
-                self._page = None
-                self._initialized = False
+                self._thread.start()
 
-            if self._context is None:
-                self._context = self._browser.new_context(storage_state=SESSION_FILE)
-                self._page = None
-                self._initialized = False
+    def run(self, fn: Callable, *args, **kwargs):
+        """Execute ``fn`` with a ready Playwright page on the worker thread."""
 
-            if self._page is None or self._page.is_closed():
-                self._page = self._context.new_page()
-                self._initialized = False
+        self._ensure_worker()
+        task = _Task(fn, args, kwargs)
+        self._task_queue.put(task)
+        task.wait()
 
-            if not self._initialized:
-                print("\n🌐 Opening ICE ICA application...")
-                self._page.goto(APP_URL, timeout=60000)
-                self._page.wait_for_load_state("networkidle")
-                self._initialized = True
+        if task.exception is not None:
+            raise task.exception
 
-            return self._page
+        return task.result
 
     def mark_needs_reload(self):
-        """Indicate that the next call should reload the main application URL."""
+        """Indicate that the page should reload before the next task."""
 
-        with self._lock:
-            self._initialized = False
+        self._reload_event.set()
 
     def close(self):
-        """Close the Playwright resources (optional – browser can stay open)."""
+        """Stop the worker thread and release Playwright resources."""
 
-        with self._lock:
-            self._teardown_locked()
+        with self._thread_lock:
+            if self._thread and self._thread.is_alive():
+                self._task_queue.put(self._stop_sentinel)
+                self._thread.join()
+            self._thread = None
 
-    def _teardown_locked(self):
-        if self._page and not self._page.is_closed():
-            self._page.close()
-        self._page = None
+    def _worker_loop(self):
+        playwright = None
+        browser = None
+        context = None
+        page = None
+        initialized = False
 
-        if self._context:
-            self._context.close()
-        self._context = None
+        try:
+            while True:
+                task = self._task_queue.get()
 
-        if self._browser and self._browser.is_connected():
-            self._browser.close()
-        self._browser = None
+                if task is self._stop_sentinel:
+                    self._task_queue.task_done()
+                    break
 
-        if self._playwright:
-            self._playwright.stop()
-        self._playwright = None
-        self._initialized = False
-        self._owner_thread_id = None
+                try:
+                    if self._reload_event.is_set():
+                        initialized = False
+                        self._reload_event.clear()
+
+                    if playwright is None:
+                        playwright = sync_playwright().start()
+
+                    if browser is None or not browser.is_connected():
+                        browser = playwright.chromium.launch(
+                            headless=False, slow_mo=150
+                        )
+                        context = None
+                        page = None
+                        initialized = False
+
+                    if context is None:
+                        context = browser.new_context(storage_state=SESSION_FILE)
+                        page = None
+                        initialized = False
+
+                    if page is None or page.is_closed():
+                        page = context.new_page()
+                        initialized = False
+
+                    if not initialized:
+                        print("\n🌐 Opening ICE ICA application...")
+                        page.goto(APP_URL, timeout=60000)
+                        page.wait_for_load_state("networkidle")
+                        initialized = True
+
+                    result = task.fn(page, *task.args, **task.kwargs)
+                    task.set_result(result)
+
+                except Exception as exc:  # noqa: BLE001 - propagate original error
+                    initialized = False
+                    self._reload_event.set()
+                    task.set_exception(exc)
+
+                finally:
+                    self._task_queue.task_done()
+
+        finally:
+            try:
+                if page and not page.is_closed():
+                    page.close()
+                if context:
+                    context.close()
+                if browser and browser.is_connected():
+                    browser.close()
+                if playwright:
+                    playwright.stop()
+            finally:
+                self._reload_event.clear()
 
 
 browser_session = BrowserSession()
+
+
+def _perform_margin_calculation(page, excel_path: Path):
+    """Core Playwright automation that must run on the worker thread."""
+
+    # Check and clear existing portfolios
+    checkbox_locator = (
+        page.get_by_role(
+            "gridcell",
+            name="Press Space to toggle row selection (unchecked) All Portfolios (1)",
+        )
+        .get_by_label("Press Space to toggle row")
+        .first
+    )
+
+    if checkbox_locator.count() > 0:
+        print("🗑️  Clearing existing portfolios...")
+        checkbox_locator.check()
+        page.get_by_role("button", name="Actions").first.click()
+        page.get_by_role("button", name="Delete").click()
+        page.get_by_text("Delete", exact=True).click()
+        page.get_by_role(
+            "columnheader",
+            name="Press Space to toggle all rows selection (unchecked) Calculation ID",
+        ).get_by_label("Press Space to toggle all").first.check()
+        page.get_by_role("button", name="Actions").nth(1).click()
+        page.get_by_role("button", name="Delete").nth(1).click()
+        page.get_by_role("button", name="OK").click()
+        time.sleep(2)
+    else:
+        print("✓ No existing portfolios to clear")
+
+    # Navigate to Tools → Upload Trades
+    print("\n📤 Uploading positions file...")
+    page.get_by_role("menuitem", name="Tools").click()
+    page.get_by_role("menuitem", name="Upload Trades").click()
+
+    # Upload the Excel file
+    page.get_by_role("button", name=re.compile("Select file", re.I)).set_input_files(
+        str(excel_path)
+    )
+    page.get_by_role("button", name="Upload").click()
+
+    # Wait for upload confirmation
+    page.wait_for_selector("button:has-text('OK')", timeout=60000)
+    page.get_by_role("button", name="OK").click()
+    time.sleep(3)
+    okButtonLocator = page.get_by_role("button", name="OK")
+    if okButtonLocator.is_visible():
+        okButtonLocator.click()
+    print("✅ Upload completed")
+
+    # Select all accounts and run calculation
+    print("\n🧮 Running margin calculation...")
+    page.locator(
+        "input[aria-label*='Press Space to toggle row selection']"
+    ).first.check()
+    page.get_by_role("button", name="Run Analytics").click()
+    page.get_by_role("tabpanel").filter(has_text="Run").get_by_role("button").nth(
+        1
+    ).click()
+
+    # Wait for calculation to complete (fixed time)
+    print("⏳ Waiting for calculation to complete (5 seconds)...")
+    time.sleep(5)  # Results appear within 5 seconds
+    print("✅ Calculation completed")
+
+    # Get the margin result directly from the cell
+    print("\n📋 Extracting margin result...")
+
+    # Method 1: Try to get text directly from the cell
+    # try:
+    #     result_cell = page.locator(RESULT_CELL_ID)
+    #     result_cell.wait_for(timeout=30000, state="visible")  # 30 second timeout
+    #     copied_text = result_cell.inner_text().strip()
+    #     print(f"✅ Margin extracted: {copied_text}")
+    # except Exception as e:
+    #     print(f"⚠️ Direct extraction failed: {e}")
+    #     # Method 2: Fallback to clipboard method
+    #     print("Trying clipboard method...")
+    #     page.locator(RESULT_CELL_ID).click(button="right", timeout=60000)
+    #     time.sleep(0.5)
+    #     page.get_by_text("Copy").first.click(timeout=5000)
+    #     time.sleep(1)
+    #     copied_text = pyperclip.paste().strip()
+    #     print(f"✅ Margin copied via clipboard: {copied_text}")
+
+    # # Result will be shown in the modal
+    # print(f"\n{'='*60}")
+    # print(f"✅ SUCCESS! Margin: {copied_text}")
+    # print(f"{'='*60}\n")
+
+    return
 
 
 def run_margin_calc(excel_path, session: Optional[BrowserSession] = None):
@@ -193,94 +336,10 @@ def run_margin_calc(excel_path, session: Optional[BrowserSession] = None):
     read_excel_file(excel_path)
 
     session = session or browser_session
-    page = session.ensure_page()
 
     try:
-        # Check and clear existing portfolios
-        checkbox_locator = (
-            page.get_by_role(
-                "gridcell",
-                name="Press Space to toggle row selection (unchecked) All Portfolios (1)",
-            )
-            .get_by_label("Press Space to toggle row")
-            .first
-        )
-
-        if checkbox_locator.count() > 0:
-            print("🗑️  Clearing existing portfolios...")
-            checkbox_locator.check()
-            page.get_by_role("button", name="Actions").first.click()
-            page.get_by_role("button", name="Delete").click()
-            page.get_by_text("Delete", exact=True).click()
-            page.get_by_role(
-                "columnheader",
-                name="Press Space to toggle all rows selection (unchecked) Calculation ID",
-            ).get_by_label("Press Space to toggle all").first.check()
-            page.get_by_role("button", name="Actions").nth(1).click()
-            page.get_by_role("button", name="Delete").nth(1).click()
-            page.get_by_role("button", name="OK").click()
-            time.sleep(2)
-        else:
-            print("✓ No existing portfolios to clear")
-
-        # Navigate to Tools → Upload Trades
-        print("\n📤 Uploading positions file...")
-        page.get_by_role("menuitem", name="Tools").click()
-        page.get_by_role("menuitem", name="Upload Trades").click()
-
-        # Upload the Excel file
-        page.get_by_role(
-            "button", name=re.compile("Select file", re.I)
-        ).set_input_files(str(excel_path))
-        page.get_by_role("button", name="Upload").click()
-
-        # Wait for upload confirmation
-        page.wait_for_selector("button:has-text('OK')", timeout=60000)
-        page.get_by_role("button", name="OK").click()
-        print("✅ Upload completed")
-
-        # Select all accounts and run calculation
-        print("\n🧮 Running margin calculation...")
-        page.locator(
-            "input[aria-label*='Press Space to toggle row selection']"
-        ).first.check()
-        page.get_by_role("button", name="Run Analytics").click()
-        page.get_by_role("tabpanel").filter(has_text="Run").get_by_role("button").nth(
-            1
-        ).click()
-
-        # Wait for calculation to complete (fixed time)
-        print("⏳ Waiting for calculation to complete (5 seconds)...")
-        time.sleep(5)  # Results appear within 5 seconds
-        print("✅ Calculation completed")
-
-        # Get the margin result directly from the cell
-        # print("\n📋 Extracting margin result...")
-
-        # # Method 1: Try to get text directly from the cell
-        # try:
-        #     result_cell = page.locator(RESULT_CELL_ID)
-        #     result_cell.wait_for(timeout=30000, state="visible")  # 30 second timeout
-        #     copied_text = result_cell.inner_text().strip()
-        #     print(f"✅ Margin extracted: {copied_text}")
-        # except Exception as e:
-        #     print(f"⚠️ Direct extraction failed: {e}")
-        #     # Method 2: Fallback to clipboard method
-        #     print("Trying clipboard method...")
-        #     page.locator(RESULT_CELL_ID).click(button="right", timeout=60000)
-        #     time.sleep(0.5)
-        #     page.get_by_text("Copy").first.click(timeout=5000)
-        #     time.sleep(1)
-        #     copied_text = pyperclip.paste().strip()
-        #     print(f"✅ Margin copied via clipboard: {copied_text}")
-
-        # # Result will be shown in the modal
-        # print(f"\n{'='*60}")
-        # print(f"✅ SUCCESS! Margin: {copied_text}")
-        # print(f"{'='*60}\n")
-
-        # return copied_text
-
+        session.run(_perform_margin_calculation, excel_path)
+        return
     except Exception as e:
         print(f"\n❌ Error during calculation: {e}")
         session.mark_needs_reload()

@@ -201,24 +201,24 @@ class MarginCalculatorGUI:
             self.update_status("="*50)
 
             # Run the calculation
-            result = run_margin_calc(str(self.excel_path))
+            run_margin_calc(str(self.excel_path))
 
             # Success
             self.update_status("")
             self.update_status("="*50)
             self.update_status(f"✅ SUCCESS!")
-            self.update_status(f"Calculated Margin: {result}")
+            # self.update_status(f"Calculated Margin: {result}")
             self.update_status(f"Result saved to: {self.excel_path.name}")
             self.update_status("="*50)
 
             # Show success dialog
-            self.root.after(
-                0,
-                lambda: messagebox.showinfo(
-                    "Success",
-                    f"Margin calculated successfully!\n\nResult: {result}\n\nCheck your Excel file."
-                )
-            )
+            # self.root.after(
+            #     0,
+            #     lambda: messagebox.showinfo(
+            #         "Success",
+            #         f"Margin calculated successfully!\n\nResult: {result}\n\nCheck your Excel file."
+            #     )
+            # )
 
         except FileNotFoundError as e:
             error_msg = str(e)
